@@ -4,10 +4,13 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -15,10 +18,12 @@
 #define INN_VERSION "0.0.1"
 
 #define TAB_STOP 8
+#define QUIT_TIMES 3
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editor_key {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -30,6 +35,7 @@ enum editor_key {
     PAGE_DOWN
 };
 
+/* data */
 typedef struct erow {
     int size;
     int rsize;
@@ -39,16 +45,25 @@ typedef struct erow {
 
 struct editor_config {
     int cx, cy;
+    int rx;
     int rowoff;
     int coloff;
     int screenrows;
     int screencols;
     int numrows;
     erow* row;
+    int dirty;
+    char* filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
     struct termios orig_termios;
 };
-struct editor_config ECONF;
+struct editor_config ES;
 
+/* forward declarations */
+void editor_set_statusmessage(const char *fmt, ...);
+
+/* terminal */
 void clear_screen() {
     write(STDIN_FILENO, "\x1b[2J", 4);
     write(STDIN_FILENO, "\x1b[H", 3);
@@ -61,14 +76,14 @@ void die(const char* s) {
 }
 
 void disable_raw_mode() {
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &ECONF.orig_termios) == -1) { die("tcsetattr"); }
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &ES.orig_termios) == -1) { die("tcsetattr"); }
 }
 
 void enable_raw_mode() {
-    if (tcgetattr(STDIN_FILENO, &ECONF.orig_termios) == -1) { die("tcgetattr"); }
+    if (tcgetattr(STDIN_FILENO, &ES.orig_termios) == -1) { die("tcgetattr"); }
     atexit(disable_raw_mode);
 
-    struct termios raw = ECONF.orig_termios;
+    struct termios raw = ES.orig_termios;
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON); // disable ICRNL=carriage-return/new-line trans, IXON=ctrl-s/ctrl-q flow control
     raw.c_oflag &= ~(OPOST); // disable output processing
     raw.c_cflag |= (CS8);
@@ -156,6 +171,19 @@ int get_window_size(int* rows, int* cols) {
     }
 }
 
+/* row operations */
+int editor_row_cxtorx(erow* row, int cx) {
+    int rx = 0;
+    int j;
+    for (j = 0; j < cx; j++) {
+        if (row->chars[j] == '\t') {
+            rx += (TAB_STOP - 1) - (rx % TAB_STOP);
+        }
+        rx++;
+    }
+    return rx;
+}
+
 void update_row(erow* row) {
     int tabs = 0;
     int j;
@@ -180,23 +208,128 @@ void update_row(erow* row) {
     row->rsize = idx;
 }
 
-void editor_append_row(char* s, size_t len) {
-    ECONF.row = realloc(ECONF.row, sizeof(erow) * (ECONF.numrows + 1));
-    int at = ECONF.numrows;
+void editor_insert_row(int at, char* s, size_t len) {
+    if (at < 0 || at > ES.numrows) return;
 
-    ECONF.row[at].size = len;
-    ECONF.row[at].chars = malloc(len+1);
-    memcpy(ECONF.row[at].chars, s, len);
-    ECONF.row[at].chars[len] = '\0';
+    ES.row = realloc(ES.row, sizeof(erow) * (ES.numrows + 1));
+    memmove(&ES.row[at + 1], &ES.row[at], sizeof(erow) * (ES.numrows - at));
 
-    ECONF.row[at].rsize = 0;
-    ECONF.row[at].render = NULL;
-    update_row(&ECONF.row[at]);
+    ES.row[at].size = len;
+    ES.row[at].chars = malloc(len+1);
+    memcpy(ES.row[at].chars, s, len);
+    ES.row[at].chars[len] = '\0';
 
-    ECONF.numrows++;
+    ES.row[at].rsize = 0;
+    ES.row[at].render = NULL;
+    update_row(&ES.row[at]);
+
+    ES.numrows++;
+    ES.dirty++;
+}
+
+void editor_free_row(erow* row) {
+    free(row->render);
+    free(row->chars);
+}
+
+void editor_delete_row(int at) {
+    if (at < 0 || at >= ES.numrows) return;
+    editor_free_row(&ES.row[at]);
+    memmove(&ES.row[at], &ES.row[at + 1], sizeof(erow) * (ES.numrows - at - 1));
+    ES.numrows--;
+    ES.dirty++;
+}
+
+void row_insert_char(erow* row, int at, int c) {
+    if (at < 0 || at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);
+    memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+    update_row(row);
+    ES.dirty++;
+}
+
+void row_append_string(erow* row, char* s, size_t len) {
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(&row->chars[row->size], s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    update_row(row);
+    ES.dirty++;
+}
+
+void row_delete_char(erow* row, int at) {
+    if (at < 0 || at >= row->size) return;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size--;
+    update_row(row);
+    ES.dirty++;
+}
+
+/* editor operations */
+void editor_insert_char(int c) {
+    if (ES.cy == ES.numrows) { editor_insert_row(ES.numrows, "", 0); }
+    row_insert_char(&ES.row[ES.cy], ES.cx, c);
+    ES.cx++;
+}
+
+void editor_insert_newline() {
+    if (ES.cx == 0) {
+        editor_insert_row(ES.cy, "", 0);
+    } else {
+        erow* row = &ES.row[ES.cy];
+        editor_insert_row(ES.cy + 1, &row->chars[ES.cx], row->size - ES.cx);
+        row = &ES.row[ES.cy];
+        row->size = ES.cx;
+        row->chars[row->size] = '\0';
+        update_row(row);
+    }
+    ES.cy++;
+    ES.cx = 0;
+}
+
+void editor_delete_char() {
+    if (ES.cy == ES.numrows) return;
+    if (ES.cx == 0 && ES.cy == 0) return;
+
+    erow* row = &ES.row[ES.cy];
+    if (ES.cx > 0) {
+        row_delete_char(row, ES.cx - 1);
+        ES.cx--;
+    } else {
+        ES.cx = ES.row[ES.cy - 1].size;
+        row_append_string(&ES.row[ES.cy - 1], row->chars, row->size);
+        editor_delete_row(ES.cy);
+        ES.cy--;
+    }
+}
+
+/* file i/o */
+
+char* rows_to_string(int* buflen) {
+    int total_len = 0;
+    int j;
+    for (j = 0; j < ES.numrows; j++) {
+        total_len += ES.row[j].size + 1;
+    }
+    *buflen = total_len;
+
+    char* buf = malloc(total_len);
+    char* p = buf;
+    for (j = 0; j < ES.numrows; j++) {
+        memcpy(p, ES.row[j].chars, ES.row[j].size);
+        p += ES.row[j].size;
+        *p = '\n';
+        p++;
+    }
+    return buf;
 }
 
 void editor_open(char* filename) {
+    free(ES.filename);
+    ES.filename = strdup(filename);
+
     FILE *fp = fopen(filename, "r");
     if (!fp) die("fopen");
 
@@ -209,13 +342,40 @@ void editor_open(char* filename) {
                                line[linelen - 1] == '\r')) {
             linelen--;
         }
-        editor_append_row(line, linelen);
+        editor_insert_row(ES.numrows, line, linelen);
     }
     free(line);
     fclose(fp);
+    ES.dirty = 0;
 }
 
-// append buffer
+void editor_save() {
+    // TODO:
+    // * use temporary file
+    // * error checking
+    if (ES.filename == NULL) return;
+
+    int len;
+    char* buf = rows_to_string(&len);
+
+    int fd = open(ES.filename, O_RDWR | O_CREAT, 0644);
+    if (fd != -1) {
+        if (ftruncate(fd, len) != -1) {
+            if (write(fd, buf, len) == len) {
+                close(fd);
+                free(buf);
+                ES.dirty = 0;
+                editor_set_statusmessage("%d bytes written to disk", len);
+                return;
+            }
+        }
+        close(fd);
+    }
+    free(buf);
+    editor_set_statusmessage("save failed. I/O error: %s", strerror(errno));
+}
+
+/* append buffer */
 struct abuf {
     char *b;
     int len;
@@ -235,32 +395,38 @@ void ab_free(struct abuf* ab) {
     free(ab->b);
 }
 
+/* output */
 void editor_scroll() {
-    if (ECONF.cy < ECONF.rowoff) {
-        ECONF.rowoff = ECONF.cy;
+    ES.rx = 0;
+    if (ES.cy < ES.numrows) {
+        ES.rx = editor_row_cxtorx(&ES.row[ES.cy], ES.cx);
     }
-    if (ECONF.cy >= ECONF.rowoff + ECONF.screenrows) {
-        ECONF.rowoff = ECONF.cy - ECONF.screenrows + 1;
+
+    if (ES.cy < ES.rowoff) {
+        ES.rowoff = ES.cy;
     }
-    if (ECONF.cx < ECONF.coloff) {
-        ECONF.coloff = ECONF.cx;
+    if (ES.cy >= ES.rowoff + ES.screenrows) {
+        ES.rowoff = ES.cy - ES.screenrows + 1;
     }
-    if (ECONF.cx >= ECONF.coloff + ECONF.screencols) {
-        ECONF.coloff = ECONF.cx - ECONF.screencols + 1;
+    if (ES.rx < ES.coloff) {
+        ES.coloff = ES.rx;
+    }
+    if (ES.rx >= ES.coloff + ES.screencols) {
+        ES.coloff = ES.rx - ES.screencols + 1;
     }
 }
 
 void draw_rows(struct abuf* ab) {
     int y;
-    for (y=0; y < ECONF.screenrows; y++) {
-        int filerow = y + ECONF.rowoff;
-        if (filerow >= ECONF.numrows) {
-            if (ECONF.numrows == 0 && y == ECONF.screenrows / 3) {
+    for (y=0; y < ES.screenrows; y++) {
+        int filerow = y + ES.rowoff;
+        if (filerow >= ES.numrows) {
+            if (ES.numrows == 0 && y == ES.screenrows / 3) {
                 char welcome[80];
-                int welcomelen = snprintf(welcome, sizeof(welcome), "welcome to inn version %s", INN_VERSION);
-                if (welcomelen > ECONF.screencols) { welcomelen = ECONF.screencols; }
+                int welcomelen = snprintf(welcome, sizeof(welcome), "welcome to inn -- version %s", INN_VERSION);
+                if (welcomelen > ES.screencols) { welcomelen = ES.screencols; }
 
-                int padding = (ECONF.screencols - welcomelen) / 2;
+                int padding = (ES.screencols - welcomelen) / 2;
                 if (padding) {
                     ab_append(ab, "~", 1);
                 }
@@ -271,18 +437,47 @@ void draw_rows(struct abuf* ab) {
                 ab_append(ab, "~", 1);
             }
         } else {
-            int len = ECONF.row[filerow].rsize - ECONF.coloff;
+            int len = ES.row[filerow].rsize - ES.coloff;
             if (len < 0 ) len = 0;
-            if (len > ECONF.screencols) len = ECONF.screencols;
-            ab_append(ab, &ECONF.row[filerow].render[ECONF.coloff], len);
+            if (len > ES.screencols) len = ES.screencols;
+            ab_append(ab, &ES.row[filerow].render[ES.coloff], len);
         }
-
 
         ab_append(ab, "\x1b[K", 3); // clear line right of cursor
-        if (y < ECONF.screenrows - 1) {
-            ab_append(ab, "\r\n", 2);
+        ab_append(ab, "\r\n", 2);
+    }
+}
+
+void draw_statusbar(struct abuf *ab) {
+    ab_append(ab, "\x1b[7m", 4);
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+                                                ES.filename ? ES.filename : "[NO NAME]",
+                                                ES.numrows,
+                                                ES.dirty ? "(modified)" : "");
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", ES.cy + 1, ES.numrows);
+    if (len > ES.screencols) len = ES.screencols;
+    ab_append(ab, status, len);
+    while (len < ES.screencols) {
+        if (ES.screencols - len == rlen) {
+            ab_append(ab, rstatus, rlen);
+            break;
+        } else {
+            ab_append(ab, " ", 1);
+            len++;
         }
     }
+    ab_append(ab, "\x1b[m", 3);
+    ab_append(ab, "\r\n", 2);
+}
+
+void draw_messagebar(struct abuf *ab) {
+    ab_append(ab, "\x1b[7m", 4);
+    ab_append(ab, "\x1b[K", 3);
+    int msglen = strlen(ES.statusmsg);
+    if (msglen > ES.screencols) msglen = ES.screencols;
+    if (msglen && time(NULL) - ES.statusmsg_time < 5) ab_append(ab, ES.statusmsg, msglen);
+    ab_append(ab, "\x1b[m", 3);
 }
 
 void refresh_screen() {
@@ -292,9 +487,11 @@ void refresh_screen() {
     ab_append(&ab, "\x1b[?25l", 6); // hide cursor
     ab_append(&ab, "\x1b[H", 3); // reset cursor position
     draw_rows(&ab);
+    draw_statusbar(&ab);
+    draw_messagebar(&ab);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (ECONF.cy - ECONF.rowoff) + 1, (ECONF.cx - ECONF.coloff) + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (ES.cy - ES.rowoff) + 1, (ES.rx - ES.coloff) + 1);
     ab_append(&ab, buf, strlen(buf));
 
     ab_append(&ab, "\x1b[?25h", 6); // show cursor
@@ -303,57 +500,92 @@ void refresh_screen() {
     ab_free(&ab);
 }
 
+void editor_set_statusmessage(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(ES.statusmsg, sizeof(ES.statusmsg), fmt, ap);
+  va_end(ap);
+  ES.statusmsg_time = time(NULL);
+}
+
+/* input */
 void move_cursor(int key) {
-    erow* row = (ECONF.cy >= ECONF.numrows) ? NULL : &ECONF.row[ECONF.cy];
+    erow* row = (ES.cy >= ES.numrows) ? NULL : &ES.row[ES.cy];
 
     switch (key) {
         case ARROW_UP:
-            if (ECONF.cy != 0) ECONF.cy--;
+            if (ES.cy != 0) ES.cy--;
             break;
         case ARROW_LEFT:
-            if (ECONF.cx != 0) ECONF.cx--;
-            else if (ECONF.cy > 0) {
-                ECONF.cy--;
-                ECONF.cx = ECONF.row[ECONF.cy].size;
+            if (ES.cx != 0) ES.cx--;
+            else if (ES.cy > 0) {
+                ES.cy--;
+                ES.cx = ES.row[ES.cy].size;
             }
             break;
         case ARROW_DOWN:
-            if (ECONF.cy < ECONF.numrows) ECONF.cy++;
+            if (ES.cy < ES.numrows) ES.cy++;
             break;
         case ARROW_RIGHT:
-            if (row && ECONF.cx < row->size) ECONF.cx++;
-            else if (row && ECONF.cx == row->size) {
-                ECONF.cy++;
-                ECONF.cx = 0;
+            if (row && ES.cx < row->size) ES.cx++;
+            else if (row && ES.cx == row->size) {
+                ES.cy++;
+                ES.cx = 0;
             }
             break;
     }
 
-    row = (ECONF.cy >= ECONF.numrows) ? NULL : &ECONF.row[ECONF.cy];
+    row = (ES.cy >= ES.numrows) ? NULL : &ES.row[ES.cy];
     int rowlen = row ? row->size : 0;
-    if (ECONF.cx > rowlen) {
-        ECONF.cx = rowlen;
+    if (ES.cx > rowlen) {
+        ES.cx = rowlen;
     }
 }
 
 void process_keypress() {
+    static int quit_times = QUIT_TIMES;
+
     int c = read_key();
 
     switch (c) {
+        case '\r':
+            editor_insert_newline();
+            break;
         case CTRL_KEY('q'):
+            if (ES.dirty && quit_times > 0) {
+                editor_set_statusmessage("no write since last change - press CTRL-q %d more times to force quit.", quit_times);
+                quit_times--;
+                return;
+            }
             clear_screen();
             exit(0);
             break;
+        case CTRL_KEY('s'):
+            editor_save();
+            break;
         case HOME_KEY:
-            ECONF.cx = 0;
+            ES.cx = 0;
             break;
         case END_KEY:
-            ECONF.cx = ECONF.screencols - 1;
+            if (ES.cy < ES.numrows) ES.cx = ES.row[ES.cy].size;
+            break;
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+            if (c == DEL_KEY) move_cursor(ARROW_RIGHT);
+            editor_delete_char();
             break;
         case PAGE_UP:
         case PAGE_DOWN:
             {
-                int times = ECONF.screenrows;
+                if (c == PAGE_UP) {
+                    ES.cy = ES.rowoff;
+                } else if (c == PAGE_DOWN) {
+                    ES.cy = ES.rowoff + ES.screenrows - 1;
+                    if (ES.cy > ES.numrows) ES.cy = ES.numrows;
+                }
+
+                int times = ES.screenrows;
                 while (times--) {
                     move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
                 }
@@ -365,17 +597,32 @@ void process_keypress() {
         case ARROW_DOWN:
             move_cursor(c);
             break;
+        case CTRL_KEY('l'):
+        case '\x1b':
+            break;
+        default:
+            editor_insert_char(c);
+            break;
     }
+    quit_times = QUIT_TIMES;
 }
 
+/* init */
 void init_editor() {
-    ECONF.cx = 0;
-    ECONF.cy = 0;
-    ECONF.rowoff = 0;
-    ECONF.coloff = 0;
-    ECONF.numrows = 0;
-    ECONF.row = NULL;
-    if (get_window_size(&ECONF.screenrows, &ECONF.screencols) == -1) { die("get_window_size"); }
+    ES.cx = 0;
+    ES.cy = 0;
+    ES.rx = 0;
+    ES.rowoff = 0;
+    ES.coloff = 0;
+    ES.numrows = 0;
+    ES.row = NULL;
+    ES.dirty = 0;
+    ES.filename = NULL;
+    ES.statusmsg[0] = '\0';
+    ES.statusmsg_time = 0;
+
+    if (get_window_size(&ES.screenrows, &ES.screencols) == -1) { die("get_window_size"); }
+    ES.screenrows -= 2;
 }
 
 int main(int argc, char* argv[]) {
@@ -384,6 +631,8 @@ int main(int argc, char* argv[]) {
     if (argc >= 2) {
         editor_open(argv[1]);
     }
+
+    editor_set_statusmessage("Ctrl-Q to quit");
 
     while (1) {
         refresh_screen();
